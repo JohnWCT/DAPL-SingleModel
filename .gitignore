@@ -1,0 +1,51 @@
+### Core Python / notebook artifacts
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+
+### Virtual environments / local env
+.env
+.venv/
+env/
+venv/
+ENV/
+
+### Build / packaging / test caches
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+### IDE / editor local configs
+.idea/
+.cursor/
+
+### Project outputs (large folders)
+data/
+weights/
+outputs/
+result/
+finetune_result/
+
+### Required large folders in this project
+data_Winnie/
+output_dir/
+result/
+
+### Large model / dataset files
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.bin
+*.safetensors
+*.pkl
+*.pickle
+*.joblib
+*.npz
+*.npy
