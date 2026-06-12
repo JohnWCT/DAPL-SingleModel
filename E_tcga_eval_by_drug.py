@@ -4,7 +4,7 @@ E_tcga_eval_by_drug.py
 
 接續 `D_summary.py` 產出的目錄，讀取複製後的 C 階段預測檔：
 
-    <d_summary_dir>/copied_best_C_prototypical/tcga_eval_predictions.csv
+    <d_summary_dir>/copied_best_C_prototypical/target_eval_predictions.csv
 
 依**個別藥物**（預設 `drug_id`）彙總 TCGA eval 表現：對每個 CV fold 先算一組
 分類指標，再對各指標做跨 fold 的 mean / std。
@@ -16,7 +16,7 @@ Accuracy、F1、Precision、Recall 的 `_mean` / `_std`。
 
     docker exec DAPL python3 /workspace/DAPL_git/E_tcga_eval_by_drug.py \\
       --d_summary_dir /workspace/DAPL_git/output_dir/repro_MDSM_D_summary_classification_100epoch \\
-      --output_csv /workspace/DAPL_git/output_dir/repro_MDSM_D_summary_classification_100epoch/tcga_eval_by_drug_fold_mean_std.csv
+      --output_csv /workspace/DAPL_git/output_dir/repro_MDSM_D_summary_classification_100epoch/target_eval_by_drug_fold_mean_std.csv
 """
 
 from __future__ import annotations
@@ -175,7 +175,7 @@ def run(d_summary_dir: str, rel_predictions: str, drug_key: str, output_csv: str
     out_df = pd.DataFrame(rows_out)
     out_path = output_csv
     if not out_path:
-        out_path = os.path.join(d_summary_dir, "tcga_eval_by_drug_fold_mean_std.csv")
+        out_path = os.path.join(d_summary_dir, "target_eval_by_drug_fold_mean_std.csv")
     ensure_dir(os.path.dirname(os.path.abspath(out_path)) or ".")
     out_df.to_csv(out_path, index=False)
     return out_df
@@ -183,7 +183,7 @@ def run(d_summary_dir: str, rel_predictions: str, drug_key: str, output_csv: str
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="依 D_summary 輸出目錄內的 tcga_eval_predictions.csv，對各藥物做跨 fold mean/std 彙總。"
+        description="依 D_summary 輸出目錄內的 target_eval_predictions.csv，對各藥物做跨 fold mean/std 彙總。"
     )
     p.add_argument(
         "--d_summary_dir",
@@ -192,7 +192,7 @@ def parse_args():
     )
     p.add_argument(
         "--predictions_rel_path",
-        default=os.path.join("copied_best_C_prototypical", "tcga_eval_predictions.csv"),
+        default=os.path.join("copied_best_C_prototypical", "target_eval_predictions.csv"),
         help="相對於 d_summary_dir 的預測檔路徑",
     )
     p.add_argument(
@@ -203,7 +203,7 @@ def parse_args():
     p.add_argument(
         "--output_csv",
         default=None,
-        help="輸出 CSV 路徑；預設寫在 d_summary_dir/tcga_eval_by_drug_fold_mean_std.csv",
+        help="輸出 CSV 路徑；預設寫在 d_summary_dir/target_eval_by_drug_fold_mean_std.csv",
     )
     return p.parse_args()
 
@@ -217,7 +217,7 @@ def main():
         drug_key=args.drug_key,
         output_csv=args.output_csv,
     )
-    out_path = args.output_csv or os.path.join(d_summary_dir, "tcga_eval_by_drug_fold_mean_std.csv")
+    out_path = args.output_csv or os.path.join(d_summary_dir, "target_eval_by_drug_fold_mean_std.csv")
     print(f"[E_tcga_eval_by_drug] wrote {out_path} ({len(out_df)} drugs)")
 
 

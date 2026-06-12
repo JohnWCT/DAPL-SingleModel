@@ -22,9 +22,11 @@ C_prototypical.py
 
 輸出包含：
 - 每 fold learning curve 與最佳模型
-- CCLE fold-level test metrics + mean/std
-- TCGA fold-level eval metrics + mean/std
+- CCLE fold-level test metrics + mean/std（legacy）
+- TCGA target eval：target_eval_predictions* + SSDA 彙總表（主/次要各一份）
 - CCLE/TCGA 每筆樣本 prediction
+- SSDA 對齊彙總（source_test / target_eval / target_eval_only / target_eval_DAPL）：
+  macro / weighted / overall + per-drug fold mean/std
 """
 
 import argparse
@@ -61,6 +63,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
+from dapl_eval_outputs import DEFAULT_TCGA_EVAL_SOURCES, write_full_eval_outputs
 from tools.dataprocess import cat_tensor_with_drug
 from tools.model import (
     Classify,
@@ -248,6 +251,7 @@ def prepare_tcga_dapl(args):
     label_col = args.tcga_label_col
     drug_name_map, ambiguous = load_drug_name_map(args.drug_smiles_input, args.drug_id_col, args.drug_name_col)
     if ambiguous:
+        ensure_dir(args.output_dir)
         pd.DataFrame(ambiguous).to_csv(
             os.path.join(args.output_dir, "ambiguous_drug_name_mapping.csv"), index=False
         )
@@ -926,7 +930,14 @@ def to_feature_matrix(df):
 def make_loader(x, y, batch_size, shuffle):
     tensor_x = torch.from_numpy(x.astype(np.float32))
     tensor_y = torch.from_numpy(y.astype(np.float32))
-    return DataLoader(TensorDataset(tensor_x, tensor_y), batch_size=batch_size, shuffle=shuffle, drop_last=False)
+    # Classify uses BatchNorm1d; a single-sample training batch raises ValueError.
+    drop_last = bool(shuffle)
+    return DataLoader(
+        TensorDataset(tensor_x, tensor_y),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+    )
 
 
 def predict(model, x, batch_size):
@@ -1305,16 +1316,16 @@ def make_finetune_dir_name(ft_param):
     return "ftlr_" + str(ft_param["ftlr"]) + ",CosAL_" + str(ft_param["scheduler_flag"])
 
 
-def prepare_tcga_eval_data(args, tcga_latent, drug_latent):
-    """Load TCGA_drug_response_from_DAPL.csv for eval only. Returns DataFrame with features."""
-    if args.tcga_eval_format == "prism_format":
-        tcga_eval_input = resolve_tcga_eval_input_from_gt(args.gt_input)
-        raw = pd.read_csv(tcga_eval_input)
+def prepare_tcga_eval_table(args, input_path, eval_format, cancer_type_col=None):
+    """Parse a TCGA drug-response CSV into a normalized eval table (no latent alignment)."""
+    if eval_format == "prism_format":
+        raw = pd.read_csv(input_path)
         required = [args.tcga_sample_id_col, args.tcga_label_col, args.tcga_drug_id_col]
         missing = [col for col in required if col not in raw.columns]
         if missing:
             raise ValueError(f"TCGA PRISM-format eval input missing required columns: {missing}")
-        cancer_type = raw[args.tcga_cancer_type_col].astype(str) if args.tcga_cancer_type_col in raw.columns else "TCGA_eval"
+        ctype_col = cancer_type_col or args.tcga_cancer_type_col
+        cancer_type = raw[ctype_col].astype(str) if ctype_col in raw.columns else "TCGA_eval"
         tcga_eval_df = pd.DataFrame(
             {
                 "sample_id": raw[args.tcga_sample_id_col].astype(str).map(tcga_patient_key),
@@ -1326,16 +1337,18 @@ def prepare_tcga_eval_data(args, tcga_latent, drug_latent):
                 "source_table": "TCGA_PRISM_FORMAT",
             }
         )
-    elif args.tcga_eval_format == "tcga_dapl":
+    elif eval_format == "tcga_dapl":
         args_tcga = deepcopy(args)
-        args_tcga.gt_input = args.tcga_eval_input
+        args_tcga.gt_input = input_path
+        if cancer_type_col:
+            args_tcga.tcga_cancer_type_col = cancer_type_col
         tcga_eval_df = prepare_tcga_dapl(args_tcga)
-        # For eval, always use binary Label column regardless of task_type
         tcga_eval_df["ground_truth"] = pd.to_numeric(
-            pd.read_csv(args.tcga_eval_input)[args.tcga_label_col], errors="coerce"
+            pd.read_csv(input_path)[args.tcga_label_col], errors="coerce"
         )
     else:
-        raise ValueError(f"unsupported tcga_eval_format: {args.tcga_eval_format}")
+        raise ValueError(f"unsupported tcga_eval_format: {eval_format}")
+
     tcga_eval_df = tcga_eval_df.dropna(subset=["ground_truth", "drug_id"]).copy()
     tcga_eval_df["ground_truth"] = pd.to_numeric(tcga_eval_df["ground_truth"], errors="coerce")
     tcga_eval_df = tcga_eval_df.dropna(subset=["ground_truth"]).copy()
@@ -1344,7 +1357,13 @@ def prepare_tcga_eval_data(args, tcga_latent, drug_latent):
         bad = tcga_eval_df.loc[invalid_label, "ground_truth"].head(10).tolist()
         raise ValueError(f"TCGA eval labels must be binary 0/1; examples: {bad}")
     tcga_eval_df["ground_truth"] = tcga_eval_df["ground_truth"].astype(np.float32)
+    return tcga_eval_df
 
+
+def align_tcga_eval_features(tcga_eval_df, tcga_latent, drug_latent, source_table="TCGA"):
+    """Align TCGA eval rows with latent features."""
+    if tcga_eval_df is None or tcga_eval_df.empty:
+        return pd.DataFrame()
     tcga_prefix_map = build_prefix_map(tcga_latent)
     rows = []
     for _, row in tcga_eval_df.iterrows():
@@ -1360,13 +1379,69 @@ def prepare_tcga_eval_data(args, tcga_latent, drug_latent):
             "cancer_type": str(row["cancer_type"]),
             "ground_truth": float(row["ground_truth"]),
             "original_drug_name": str(row["original_drug_name"]),
-            "source_table": "TCGA_DAPL",
+            "source_table": str(row.get("source_table", source_table)),
             "feature": np.concatenate([
                 np.asarray(sample_vec, dtype=np.float32),
                 np.asarray(drug_vec, dtype=np.float32),
             ]),
         })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def prepare_tcga_eval_data(args, tcga_latent, drug_latent, input_path=None, eval_format=None, cancer_type_col=None):
+    """Load one TCGA eval source and return aligned feature DataFrame."""
+    if input_path is None:
+        if args.tcga_eval_format == "prism_format":
+            input_path = resolve_tcga_eval_input_from_gt(args.gt_input)
+            eval_format = "prism_format"
+        else:
+            input_path = args.tcga_eval_input
+            eval_format = "tcga_dapl"
+    eval_format = eval_format or args.tcga_eval_format
+    tcga_eval_df = prepare_tcga_eval_table(args, input_path, eval_format, cancer_type_col=cancer_type_col)
+    return align_tcga_eval_features(tcga_eval_df, tcga_latent, drug_latent)
+
+
+def load_tcga_eval_sources(args, tcga_latent, drug_latent, log_path=None):
+    """Load all configured TCGA target eval sets. Returns {suffix: aligned_df}."""
+    sources = getattr(args, "tcga_eval_sources", None) or DEFAULT_TCGA_EVAL_SOURCES
+    out = {}
+    for src in sources:
+        suffix = src["suffix"]
+        path = src["path"]
+        if not os.path.isfile(path):
+            if log_path:
+                log_message(log_path, f"SKIP TCGA eval suffix='{suffix}': file not found: {path}")
+            continue
+        try:
+            aligned = prepare_tcga_eval_data(
+                args,
+                tcga_latent,
+                drug_latent,
+                input_path=path,
+                eval_format=src.get("format", "tcga_dapl"),
+                cancer_type_col=src.get("cancer_type_col"),
+            )
+        except Exception as err:
+            if log_path:
+                log_message(log_path, f"SKIP TCGA eval suffix='{suffix}': {err}")
+            continue
+        if aligned.empty:
+            if log_path:
+                log_message(log_path, f"SKIP TCGA eval suffix='{suffix}': no aligned rows from {path}")
+            continue
+        out[suffix] = aligned
+        if log_path:
+            log_message(
+                log_path,
+                f"TCGA eval suffix='{suffix}' rows={len(aligned)} source={path} ({src.get('description', '')})",
+            )
+    return out
+
+
+def target_eval_prediction_basename(suffix):
+    """SSDA-aligned target prediction filename."""
+    return f"target_eval_predictions{suffix}.csv" if suffix else "target_eval_predictions.csv"
 
 
 def build_tcga_proto_features(tcga_eval_df):
@@ -1385,8 +1460,27 @@ def parse_args():
     parser.add_argument("--regression_label_col", default="neg_log2_auc")
     parser.add_argument("--prism_sample_id_col", default="depmap_id")
     parser.add_argument("--prism_drug_id_col", default="broad_id")
-    parser.add_argument("--tcga_eval_format", choices=["prism_format", "tcga_dapl"], default="prism_format")
-    parser.add_argument("--tcga_eval_input", default="data_Winnie/TCGA_drug_response_from_DAPL.csv")
+    parser.add_argument("--tcga_eval_format", choices=["prism_format", "tcga_dapl"], default="tcga_dapl")
+    parser.add_argument(
+        "--tcga_eval_input",
+        default="data/TCGA/PMID27354694_DR_OMICS_ad_intersect_pretrain_gdsc_intersect13.csv",
+        help="Legacy single TCGA eval path (superseded by DEFAULT_TCGA_EVAL_SOURCES when using load_tcga_eval_sources)",
+    )
+    parser.add_argument(
+        "--tcga_eval_gdsc_intersect13",
+        default="data/TCGA/PMID27354694_DR_OMICS_ad_intersect_pretrain_gdsc_intersect13.csv",
+        help="Main target eval (GDSC intersect13)",
+    )
+    parser.add_argument(
+        "--tcga_eval_tcga_only3",
+        default="data/TCGA/PMID27354694_DR_OMICS_ad_intersect_pretrain_tcga_only3.csv",
+        help="Secondary target eval (_only suffix)",
+    )
+    parser.add_argument(
+        "--tcga_eval_dapl",
+        default="data/TCGA/TCGA_drug_response_from_DAPL.csv",
+        help="Secondary target eval (_DAPL suffix)",
+    )
     parser.add_argument("--tcga_sample_id_col", default="Patient_id")
     parser.add_argument("--tcga_drug_name_col", default="drug_name")
     parser.add_argument("--tcga_drug_id_col", default="PubCHEM")
@@ -1422,7 +1516,54 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_one_finetune_combo(ft_param, ccle_cv_df, ccle_test_df, tcga_proto_features, tcga_eval_df,
+def _predict_tcga_fold(x_tcga_eval, args, model, proto_classifier):
+    """Return (tcga_pred, tcga_proto_prob_or_none) for one TCGA eval matrix."""
+    tcga_proto_prob = None
+    if args.task_type == "classification" and proto_classifier is not None:
+        proto_classifier.eval()
+        with torch.no_grad():
+            xt = torch.from_numpy(x_tcga_eval.astype(np.float32)).to(device)
+            raw = proto_classifier(xt).cpu().numpy()
+        tcga_pred = 1.0 / (1.0 + np.exp(-raw))
+    elif args.task_type == "classification":
+        raw = predict(model, x_tcga_eval, args.train_batch_size)
+        tcga_pred = 1.0 / (1.0 + np.exp(-raw))
+    else:
+        tcga_pred = predict(model, x_tcga_eval, args.train_batch_size)
+        if proto_classifier is not None:
+            proto_classifier.eval()
+            with torch.no_grad():
+                xt = torch.from_numpy(x_tcga_eval.astype(np.float32)).to(device)
+                proto_raw = proto_classifier(xt).cpu().numpy()
+            tcga_proto_prob = 1.0 / (1.0 + np.exp(-proto_raw))
+    return tcga_pred, tcga_proto_prob
+
+
+def _build_tcga_prediction_frame(tcga_eval_df, tcga_pred, tcga_proto_prob, fold_id, args):
+    fold_tcga_out = tcga_eval_df[
+        ["sample_id", "drug_id", "cancer_type", "ground_truth", "original_drug_name"]
+    ].copy()
+    fold_tcga_out["domain"] = "TCGA"
+    fold_tcga_out["fold"] = fold_id
+    if args.task_type == "classification":
+        fold_tcga_out["prediction_probability"] = tcga_pred
+        fold_tcga_out["prediction_binary"] = (tcga_pred >= 0.5).astype(int)
+        fold_tcga_out["prediction"] = tcga_pred
+        fold_tcga_out["prediction_type"] = "classification_probability"
+        fold_tcga_out["threshold"] = 0.5
+    else:
+        fold_tcga_out["prediction_neg_log2_auc"] = tcga_pred
+        fold_tcga_out["prediction_binary"] = (tcga_pred >= REGRESSION_BINARY_THRESHOLD).astype(int)
+        fold_tcga_out["prediction"] = tcga_pred
+        fold_tcga_out["prediction_type"] = "regression_neg_log2_auc_thresholded"
+        fold_tcga_out["threshold"] = float(REGRESSION_BINARY_THRESHOLD)
+        if tcga_proto_prob is not None:
+            fold_tcga_out["proto_prediction_probability"] = tcga_proto_prob
+            fold_tcga_out["proto_prediction_binary"] = (tcga_proto_prob >= 0.5).astype(int)
+    return fold_tcga_out
+
+
+def run_one_finetune_combo(ft_param, ccle_cv_df, ccle_test_df, tcga_proto_features, tcga_eval_dfs,
                            input_dim, args, combo_output_dir, log_path):
     """Run 5-fold CV for one fine-tune parameter combo."""
     ft_dir_name = make_finetune_dir_name(ft_param)
@@ -1440,10 +1581,13 @@ def run_one_finetune_combo(ft_param, ccle_cv_df, ccle_test_df, tcga_proto_featur
     fold_metric_rows = []
     curve_dfs = []
     ccle_prediction_rows = []
-    tcga_prediction_rows = []
+    tcga_prediction_rows = {suffix: [] for suffix in tcga_eval_dfs}
     ccle_metric_rows = []
-    tcga_metric_rows = []
-    x_tcga_eval = to_feature_matrix(tcga_eval_df) if not tcga_eval_df.empty else None
+    tcga_metric_rows = {suffix: [] for suffix in tcga_eval_dfs}
+    tcga_eval_mats = {
+        suffix: to_feature_matrix(df) if not df.empty else None
+        for suffix, df in tcga_eval_dfs.items()
+    }
     x_ccle_test = to_feature_matrix(ccle_test_df) if not ccle_test_df.empty else None
 
     for fold_id, (train_idx, val_idx) in enumerate(splitter.split(ccle_df, split_target), start=1):
@@ -1518,31 +1662,12 @@ def run_one_finetune_combo(ft_param, ccle_cv_df, ccle_test_df, tcga_proto_featur
                 fold_ccle_out["threshold"] = float(REGRESSION_BINARY_THRESHOLD)
             ccle_prediction_rows.append(fold_ccle_out)
 
-        # --- Predict on TCGA eval set ---
-        if x_tcga_eval is not None and len(x_tcga_eval) > 0:
-            tcga_proto_prob = None
-            if args.task_type == "classification" and proto_classifier is not None:
-                proto_classifier.eval()
-                with torch.no_grad():
-                    xt = torch.from_numpy(x_tcga_eval.astype(np.float32)).to(device)
-                    raw = proto_classifier(xt).cpu().numpy()
-                tcga_pred = 1.0 / (1.0 + np.exp(-raw))
-            elif args.task_type == "classification":
-                raw = predict(model, x_tcga_eval, args.train_batch_size)
-                tcga_pred = 1.0 / (1.0 + np.exp(-raw))
-            else:
-                # Main regression prediction: continuous neg_log2_auc.
-                # TCGA eval converts this value to binary using REGRESSION_BINARY_THRESHOLD.
-                tcga_pred = predict(model, x_tcga_eval, args.train_batch_size)
-                # Auxiliary proto classifier prediction.
-                # This is not the main regression output, but records whether the
-                # thresholded proto branch improves TCGA binary classification.
-                if proto_classifier is not None:
-                    proto_classifier.eval()
-                    with torch.no_grad():
-                        xt = torch.from_numpy(x_tcga_eval.astype(np.float32)).to(device)
-                        proto_raw = proto_classifier(xt).cpu().numpy()
-                    tcga_proto_prob = 1.0 / (1.0 + np.exp(-proto_raw))
+        # --- Predict on all configured TCGA eval sets ---
+        for suffix, tcga_eval_df in tcga_eval_dfs.items():
+            x_tcga_eval = tcga_eval_mats.get(suffix)
+            if x_tcga_eval is None or len(x_tcga_eval) == 0:
+                continue
+            tcga_pred, tcga_proto_prob = _predict_tcga_fold(x_tcga_eval, args, model, proto_classifier)
             tcga_metrics_fold = tcga_eval_classification_metrics(
                 y_true_binary=tcga_eval_df["ground_truth"].values,
                 pred_values=tcga_pred,
@@ -1557,33 +1682,16 @@ def run_one_finetune_combo(ft_param, ccle_cv_df, ccle_test_df, tcga_proto_featur
                 )
                 for key, value in proto_metrics.items():
                     tcga_metrics_fold[f"proto_classifier_{key}"] = value
-            tcga_metric_row = {"fold": f"fold{fold_id}", "domain": "TCGA_eval"}
+            domain_tag = "TCGA_eval" if not suffix else f"TCGA_eval{suffix}"
+            tcga_metric_row = {"fold": f"fold{fold_id}", "domain": domain_tag}
             tcga_metric_row.update(tcga_metrics_fold)
-            tcga_metric_rows.append({"fold": f"fold{fold_id}", **tcga_metrics_fold})
+            tcga_metric_rows[suffix].append({"fold": f"fold{fold_id}", **tcga_metrics_fold})
             fold_metric_rows.append(tcga_metric_row)
-            fold_tcga_out = tcga_eval_df[
-                ["sample_id", "drug_id", "cancer_type", "ground_truth", "original_drug_name"]
-            ].copy()
-            fold_tcga_out["domain"] = "TCGA"
-            fold_tcga_out["fold"] = fold_id
-            if args.task_type == "classification":
-                fold_tcga_out["prediction_probability"] = tcga_pred
-                fold_tcga_out["prediction_binary"] = (tcga_pred >= 0.5).astype(int)
-                fold_tcga_out["prediction"] = tcga_pred
-                fold_tcga_out["prediction_type"] = "classification_probability"
-                fold_tcga_out["threshold"] = 0.5
-            else:
-                fold_tcga_out["prediction_neg_log2_auc"] = tcga_pred
-                fold_tcga_out["prediction_binary"] = (
-                    tcga_pred >= REGRESSION_BINARY_THRESHOLD
-                ).astype(int)
-                fold_tcga_out["prediction"] = tcga_pred
-                fold_tcga_out["prediction_type"] = "regression_neg_log2_auc_thresholded"
-                fold_tcga_out["threshold"] = float(REGRESSION_BINARY_THRESHOLD)
-                if tcga_proto_prob is not None:
-                    fold_tcga_out["proto_prediction_probability"] = tcga_proto_prob
-                    fold_tcga_out["proto_prediction_binary"] = (tcga_proto_prob >= 0.5).astype(int)
-            tcga_prediction_rows.append(fold_tcga_out)
+            tcga_prediction_rows[suffix].append(
+                _build_tcga_prediction_frame(
+                    tcga_eval_df, tcga_pred, tcga_proto_prob, fold_id, args
+                )
+            )
 
     # --- Save learning curves ---
     if curve_dfs:
@@ -1600,24 +1708,32 @@ def run_one_finetune_combo(ft_param, ccle_cv_df, ccle_test_df, tcga_proto_featur
         "has_tcga_eval": False,
     }
 
+    ccle_pred_all = None
     if ccle_prediction_rows:
         ccle_pred_all = pd.concat(ccle_prediction_rows, ignore_index=True)
         ccle_pred_all.to_csv(os.path.join(ft_dir, "ccle_test_predictions.csv"), index=False)
-    if tcga_prediction_rows:
-        tcga_pred_all = pd.concat(tcga_prediction_rows, ignore_index=True)
-        tcga_pred_all.to_csv(os.path.join(ft_dir, "tcga_eval_predictions.csv"), index=False)
+        ccle_pred_all.to_csv(os.path.join(ft_dir, "source_test_predictions.csv"), index=False)
 
-    if tcga_metric_rows:
-        tcga_by_fold_df = pd.DataFrame(tcga_metric_rows)
-        tcga_by_fold_df.to_csv(os.path.join(ft_dir, "tcga_eval_metrics_by_fold.csv"), index=False)
+    target_pred_dfs = {}
+    for suffix, rows in tcga_prediction_rows.items():
+        if not rows:
+            continue
+        tcga_pred_all = pd.concat(rows, ignore_index=True)
+        tcga_pred_all.to_csv(os.path.join(ft_dir, target_eval_prediction_basename(suffix)), index=False)
+        target_pred_dfs[suffix] = tcga_pred_all
+
+    for suffix, metric_rows in tcga_metric_rows.items():
+        if not metric_rows:
+            continue
+        tcga_by_fold_df = pd.DataFrame(metric_rows)
         tcga_summary_df = aggregate_metric_mean_std(tcga_by_fold_df)
-        tcga_summary_df.to_csv(os.path.join(ft_dir, "tcga_eval_metrics.csv"), index=False)
-        mean_row = tcga_summary_df[tcga_summary_df["stat"] == "mean"]
-        if not mean_row.empty:
-            metric_cols = [col for col in mean_row.columns if col != "stat"]
-            for col in metric_cols:
-                combo_result[col] = float(mean_row.iloc[0][col])
-        combo_result["has_tcga_eval"] = True
+        if suffix == "":
+            mean_row = tcga_summary_df[tcga_summary_df["stat"] == "mean"]
+            if not mean_row.empty:
+                metric_cols = [col for col in mean_row.columns if col != "stat"]
+                for col in metric_cols:
+                    combo_result[col] = float(mean_row.iloc[0][col])
+            combo_result["has_tcga_eval"] = True
 
     if ccle_metric_rows:
         ccle_by_fold_df = pd.DataFrame(ccle_metric_rows)
@@ -1641,6 +1757,18 @@ def run_one_finetune_combo(ft_param, ccle_cv_df, ccle_test_df, tcga_proto_featur
         fold_metrics_df = add_fold_metric_summary(fold_metrics_df)
         fold_metrics_df.to_csv(os.path.join(ft_dir, "fold_level_metrics.csv"), index=False)
 
+    # SSDA 對齊彙總：source_test + target_eval(_only/_DAPL)
+    try:
+        write_full_eval_outputs(
+            ft_dir,
+            args.task_type,
+            source_pred_df=ccle_pred_all,
+            target_pred_dfs=target_pred_dfs,
+        )
+        log_message(log_path, f"  wrote SSDA-style eval summaries -> {ft_dir}")
+    except Exception as err:
+        log_message(log_path, f"  WARNING: SSDA-style eval summary failed: {err}")
+
     log_message(log_path, f"  finetune combo {ft_dir_name} completed")
     return combo_result
 
@@ -1655,8 +1783,36 @@ def choose_primary_metric(task_type):
     return "CCLE_test_MAE", False
 
 
+def build_tcga_eval_sources_from_args(args):
+    """Build TCGA eval source list from CLI paths."""
+    return [
+        {
+            "suffix": "",
+            "path": args.tcga_eval_gdsc_intersect13,
+            "cancer_type_col": "cancers",
+            "format": "tcga_dapl",
+            "description": "GDSC intersect13 (main target eval)",
+        },
+        {
+            "suffix": "_only",
+            "path": args.tcga_eval_tcga_only3,
+            "cancer_type_col": "cancers",
+            "format": "tcga_dapl",
+            "description": "TCGA-only3 (secondary target eval)",
+        },
+        {
+            "suffix": "_DAPL",
+            "path": args.tcga_eval_dapl,
+            "cancer_type_col": "primary_disease",
+            "format": "tcga_dapl",
+            "description": "DAPL TCGA drug response (secondary target eval)",
+        },
+    ]
+
+
 def main():
     args = parse_args()
+    args.tcga_eval_sources = build_tcga_eval_sources_from_args(args)
     # Fixed defaults by design for this workflow.
     args.n_splits = 5
     set_seed(args.random_seed)
@@ -1717,8 +1873,12 @@ def main():
             continue
         input_dim = len(ccle_cv_df.iloc[0]["feature"])
 
-        tcga_eval_df = prepare_tcga_eval_data(args, tcga_latent, drug_latent)
-        tcga_proto_features = build_tcga_proto_features(tcga_eval_df)
+        tcga_eval_dfs = load_tcga_eval_sources(args, tcga_latent, drug_latent, log_path=log_path)
+        if not tcga_eval_dfs:
+            log_message(log_path, f"SKIP {pt_name}: no TCGA eval sources aligned")
+            continue
+        main_tcga_df = tcga_eval_dfs.get("", next(iter(tcga_eval_dfs.values())))
+        tcga_proto_features = build_tcga_proto_features(main_tcga_df)
 
         # Grid search fine-tune settings: ftlr x scheduler_flag
         finetune_grid = [
@@ -1729,7 +1889,7 @@ def main():
         ]
         for ft_param in finetune_grid:
             combo_result = run_one_finetune_combo(
-                ft_param, ccle_cv_df, ccle_test_df, tcga_proto_features, tcga_eval_df,
+                ft_param, ccle_cv_df, ccle_test_df, tcga_proto_features, tcga_eval_dfs,
                 input_dim, args, combo_output_dir, log_path,
             )
             combo_result.update(

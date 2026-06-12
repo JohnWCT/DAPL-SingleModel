@@ -12,6 +12,8 @@ import pickle
 import re
 import shutil
 
+from dapl_eval_outputs import write_full_eval_outputs
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -150,6 +152,18 @@ def parse_args():
     p.add_argument("--max_points_per_domain", type=int, default=3000)
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--output_dir", default="output_dir/D_summary")
+    p.add_argument(
+        "--task_type",
+        choices=["classification", "regression"],
+        default="classification",
+        help="SSDA 風格評估：source_test 指標類型",
+    )
+    p.add_argument(
+        "--write_ssda_eval",
+        type=int,
+        default=1,
+        help="1: 在 D_summary 目錄重算 SSDA 風格 eval 表；0: 跳過",
+    )
     return p.parse_args()
 
 
@@ -306,6 +320,31 @@ def main():
     print(f"[D_summary] copied C dir -> {os.path.join(args.output_dir, 'copied_best_C_prototypical')}")
     print(f"[D_summary] t-SNE plot -> {os.path.join(args.output_dir, 'best_latent_tsne_with_cancer_type.png')}")
     print(f"[D_summary] report -> {report_path}")
+
+    if args.write_ssda_eval:
+        copied_c_dir = os.path.join(args.output_dir, "copied_best_C_prototypical")
+        target_paths = {}
+        for suffix, name in (
+            ("", "target_eval_predictions.csv"),
+            ("_only", "target_eval_predictions_only.csv"),
+            ("_DAPL", "target_eval_predictions_DAPL.csv"),
+        ):
+            path = os.path.join(copied_c_dir, name)
+            if os.path.isfile(path):
+                target_paths[suffix] = path
+        source_path = os.path.join(copied_c_dir, "source_test_predictions.csv")
+        if not os.path.isfile(source_path):
+            source_path = os.path.join(copied_c_dir, "ccle_test_predictions.csv")
+        if os.path.isfile(source_path) and target_paths:
+            write_full_eval_outputs(
+                args.output_dir,
+                args.task_type,
+                source_pred_path=source_path,
+                target_pred_paths=target_paths,
+            )
+            print(f"[D_summary] SSDA eval summaries -> {args.output_dir}")
+        else:
+            print("[D_summary] WARNING: skip SSDA eval summaries (missing prediction files)")
 
 
 if __name__ == "__main__":
